@@ -1,2 +1,3 @@
-# 0000
+# CXX2
+
 Experimental project builder

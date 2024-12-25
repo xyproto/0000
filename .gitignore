@@ -27,14 +27,14 @@ bin/
 .vscode/
 *.iml
 
-# cmd directory: ignore everything except Go source files and documentation
-cmd/*/*
-!cmd/*/*.go
-!cmd/*/*.txt
-!cmd/*/*.md
-!cmd/*/*.rst
-!cmd/*/*.asciidoc
-!cmd/*/*.1*
+# examples directory: ignore everything except Go source files and documentation
+examples/*/*
+!examples/*/*.go
+!examples/*/*.txt
+!examples/*/*.md
+!examples/*/*.rst
+!examples/*/*.asciidoc
+!examples/*/*.1*
 
 # images not in img/
 *.bmp
@@ -49,3 +49,4 @@ cmd/*/*
 include.txt
 
 cxx2
+.cxxcache

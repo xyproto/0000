@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/xyproto/distrodetector"
 	"io/fs"
 	"log"
 	"os"
@@ -14,9 +13,11 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+
+	"github.com/xyproto/distrodetector"
 )
 
-const version = "2.0.5"
+const version = "2.0.7"
 
 type Options struct {
 	CXX               string
@@ -75,38 +76,37 @@ func main() {
 	opts.DetectedDistro = distro.String()
 	adjustCompiler(opts)
 
-	allSources, err := discoverSources()
+	srcs, err := discoverSources()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if len(allSources) == 0 && !opts.Clean {
+	if len(srcs) == 0 && !opts.Clean {
 		fmt.Println("No sources found.")
 		return
 	}
 
 	var normalSources, testSources []string
-	for _, s := range allSources {
+	for _, s := range srcs {
 		if isTestSource(s) {
 			testSources = append(testSources, s)
 		} else {
 			normalSources = append(normalSources, s)
 		}
 	}
-	opts.Sources = allSources
+	opts.Sources = srcs
 	opts.TestSources = testSources
-	opts.MainSource = findMainSource(allSources)
+	opts.MainSource = findMainSource(srcs)
 
 	if opts.MainSource != "" {
-		name := guessOutputNameFromMain(opts.MainSource, opts.Win64Docker)
-		opts.OutputName = name
+		opts.OutputName = guessOutputNameFromMain(opts.MainSource, opts.Win64Docker)
 	} else if len(normalSources) > 0 {
-		n := "main"
+		out := "main"
 		if opts.Win64Docker {
-			n += ".exe"
+			out += ".exe"
 		} else if runtime.GOOS == "windows" {
-			n += ".exe"
+			out += ".exe"
 		}
-		opts.OutputName = n
+		opts.OutputName = out
 	}
 
 	if opts.Clean {
@@ -131,10 +131,18 @@ func main() {
 	}
 
 	cc, _ := loadCache()
-	if err := compileAndLink(opts, cc); err != nil {
-		log.Fatal("Build error:", err)
+
+	// If there's exactly 1 normal source, no test sources, do single-step build (no partial detection).
+	if len(normalSources) == 1 && len(testSources) == 0 && !opts.Test {
+		if err := singleStepBuild(opts, normalSources[0]); err != nil {
+			log.Fatal("Build error:", err)
+		}
+	} else {
+		if err := compileAndLink(opts, cc); err != nil {
+			log.Fatal("Build error:", err)
+		}
+		saveCache(cc)
 	}
-	saveCache(cc)
 
 	if opts.Test && len(testSources) > 0 {
 		if err := buildAndRunTests(opts, cc); err != nil {
@@ -248,8 +256,7 @@ func findMainSource(srcs []string) string {
 		}
 	}
 	if len(nt) == 1 {
-		b, e := os.ReadFile(nt[0])
-		if e == nil && strings.Contains(string(b), " main(") {
+		if b, e := os.ReadFile(nt[0]); e == nil && strings.Contains(string(b), " main(") {
 			return nt[0]
 		}
 		return nt[0]
@@ -370,7 +377,6 @@ LOOP:
 	return out
 }
 
-// pkgDiscovery prints missing headers, tries to find packages, merges pkg-config flags if found.
 func pkgDiscovery(o *Options, missing []string) {
 	fmt.Println("Missing headers:")
 	for _, h := range missing {
@@ -424,6 +430,29 @@ func saveCache(cc *CompileCache) {
 	_ = os.WriteFile(".cxxcache", b, 0o644)
 }
 
+// singleStepBuild: just one normal source, no tests -> compile and link in one g++ step
+func singleStepBuild(o *Options, source string) error {
+	on := ensureExeSuffix(o.OutputName, o.Win64Docker)
+	flags := compileFlags(o)
+	sf := ""
+	if o.Std != "" {
+		sf = "-std=" + o.Std
+	}
+	cf := joinExtraCFlags(o.ExtraCFlags)
+	linkFlags := joinExtraLDFlags(o.ExtraLDFlags)
+	line := fmt.Sprintf(`%s %s %s %s %s -o %s`,
+		o.CXX, sf, flags, cf, source, on)
+	if linkFlags != "" {
+		line += " " + linkFlags
+	}
+	fmt.Println(line)
+	if e := runCommand(line, o); e != nil {
+		return e
+	}
+	o.OutputName = on
+	return nil
+}
+
 func compileAndLink(o *Options, cc *CompileCache) error {
 	var objs []string
 	for _, s := range o.Sources {
@@ -436,25 +465,22 @@ func compileAndLink(o *Options, cc *CompileCache) error {
 		}
 		objs = append(objs, obj)
 	}
-	on := o.OutputName
-	if on == "" {
-		d, _ := os.Getwd()
-		b := filepath.Base(d)
-		if b == "src" {
-			b = "main"
-		}
-		on = b
-	}
-	if o.Win64Docker && !strings.HasSuffix(on, ".exe") {
-		on += ".exe"
-	} else if runtime.GOOS == "windows" && !strings.HasSuffix(on, ".exe") {
-		on += ".exe"
-	}
+	on := ensureExeSuffix(o.OutputName, o.Win64Docker)
 	if e := linkObjects(o, objs, on); e != nil {
 		return e
 	}
 	o.OutputName = on
 	return nil
+}
+
+func ensureExeSuffix(base string, docker bool) string {
+	if docker && !strings.HasSuffix(base, ".exe") {
+		return base + ".exe"
+	}
+	if runtime.GOOS == "windows" && !strings.HasSuffix(base, ".exe") {
+		return base + ".exe"
+	}
+	return base
 }
 
 func compileOne(o *Options, cc *CompileCache, src string) (string, error) {
@@ -584,12 +610,7 @@ func buildAndRunTests(o *Options, cc *CompileCache) error {
 		if e != nil {
 			return e
 		}
-		exe := strings.TrimSuffix(obj, ".o")
-		if o.Win64Docker && !strings.HasSuffix(exe, ".exe") {
-			exe += ".exe"
-		} else if runtime.GOOS == "windows" && !strings.HasSuffix(exe, ".exe") {
-			exe += ".exe"
-		}
+		exe := ensureExeSuffix(strings.TrimSuffix(obj, ".o"), o.Win64Docker)
 		if err := linkObjects(o, append([]string{obj}, normalObjs...), exe); err != nil {
 			return err
 		}
@@ -609,10 +630,7 @@ func buildAndRunTests(o *Options, cc *CompileCache) error {
 }
 
 func generateProFile(o *Options, normalSrc []string) error {
-	n := o.OutputName
-	if strings.HasSuffix(n, ".exe") {
-		n = strings.TrimSuffix(n, ".exe")
-	}
+	n := strings.TrimSuffix(o.OutputName, ".exe")
 	pf := n + ".pro"
 	f, e := os.Create(pf)
 	if e != nil {
@@ -732,7 +750,6 @@ func mergePkgConfigFlags(flags string, o *Options) {
 	}
 }
 
-// mapHeaderToPkg tries to guess a package name for a given header, plus an install command.
 func mapHeaderToPkg(h, distro string) (string, string) {
 	l := strings.ToLower(h)
 	ar := strings.Contains(strings.ToLower(distro), "arch")
